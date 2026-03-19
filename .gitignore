@@ -1,0 +1,17 @@
+node_modules/
+server/node_modules/
+client/node_modules/
+
+# Environment secrets - NEVER push this
+server/.env
+
+# Build output
+client/build/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
