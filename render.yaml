@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: expense-tracker-api
+    runtime: node
+    rootDir: server
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: JWT_SECRET
+        value: expense_tracker_jwt_super_secret_2024_xyz
+      - key: NODE_ENV
+        value: production
