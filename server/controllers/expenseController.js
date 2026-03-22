@@ -1,24 +1,29 @@
-const Expense = require('../models/Expense');
-const User = require('../models/User');
-const OpenAI = require('openai');
+const { v4: uuid } = require('uuid');
+const { users, expenses } = require('../store');
+const OpenAI     = require('openai');
 const nodemailer = require('nodemailer');
-const { jsPDF } = require('jspdf');
+const { jsPDF }  = require('jspdf');
 require('jspdf-autotable');
 
 // POST /api/expenses
-const createExpense = async (req, res) => {
+const createExpense = (req, res) => {
   try {
     const { amount, category, description, date } = req.body;
     if (!amount || !category)
       return res.status(400).json({ success: false, message: 'Amount and category required' });
 
-    const expense = await Expense.create({
-      userId: req.user.id,
-      amount,
+    const expense = {
+      id:          uuid(),
+      _id:         uuid(), // frontend uses _id
+      userId:      req.user.id,
+      amount:      Number(amount),
       category,
       description: description || '',
-      date: date || Date.now(),
-    });
+      date:        date ? new Date(date) : new Date(),
+      createdAt:   new Date(),
+    };
+    expense._id = expense.id; // keep consistent
+    expenses.push(expense);
     return res.status(201).json({ success: true, data: expense });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
@@ -26,13 +31,13 @@ const createExpense = async (req, res) => {
 };
 
 // DELETE /api/expenses/:id
-const deleteExpense = async (req, res) => {
+const deleteExpense = (req, res) => {
   try {
-    const expense = await Expense.findOne({ _id: req.params.id, userId: req.user.id });
-    if (!expense)
+    const idx = expenses.findIndex(e => e.id === req.params.id && e.userId === req.user.id);
+    if (idx === -1)
       return res.status(404).json({ success: false, message: 'Expense not found' });
 
-    await expense.deleteOne();
+    expenses.splice(idx, 1);
     return res.status(200).json({ success: true, message: 'Deleted' });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
@@ -40,79 +45,85 @@ const deleteExpense = async (req, res) => {
 };
 
 // GET /api/expenses  — supports ?category=Food&from=2024-01-01&to=2024-01-31
-// Improvement 5: date range + category filtering
-const getExpenses = async (req, res) => {
+const getExpenses = (req, res) => {
   try {
-    const filter = { userId: req.user.id };
-    if (req.query.category) filter.category = req.query.category;
-    if (req.query.from || req.query.to) {
-      filter.date = {};
-      if (req.query.from) filter.date.$gte = new Date(req.query.from);
-      if (req.query.to)   filter.date.$lte = new Date(req.query.to);
-    }
-    const expenses = await Expense.find(filter).sort({ date: -1 });
-    return res.status(200).json({ success: true, data: expenses });
+    let result = expenses.filter(e => e.userId === req.user.id);
+
+    if (req.query.category)
+      result = result.filter(e => e.category === req.query.category);
+
+    if (req.query.from)
+      result = result.filter(e => new Date(e.date) >= new Date(req.query.from));
+
+    if (req.query.to)
+      result = result.filter(e => new Date(e.date) <= new Date(req.query.to));
+
+    // Sort newest first
+    result.sort((a, b) => new Date(b.date) - new Date(a.date));
+
+    return res.status(200).json({ success: true, data: result });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
 };
 
-// GET /api/expenses/summary — aggregated totals per category
-// Improvement 5: used for bar chart trend data
-const getSummary = async (req, res) => {
+// GET /api/expenses/summary
+const getSummary = (req, res) => {
   try {
-    const summary = await Expense.aggregate([
-      { $match: { userId: require('mongoose').Types.ObjectId.createFromHexString(req.user.id) } },
-      { $group: { _id: '$category', total: { $sum: '$amount' }, count: { $sum: 1 } } },
-      { $sort: { total: -1 } }
-    ]);
+    const userExpenses = expenses.filter(e => e.userId === req.user.id);
+
+    const grouped = {};
+    userExpenses.forEach(e => {
+      if (!grouped[e.category]) grouped[e.category] = { _id: e.category, total: 0, count: 0 };
+      grouped[e.category].total += e.amount;
+      grouped[e.category].count += 1;
+    });
+
+    const summary = Object.values(grouped).sort((a, b) => b.total - a.total);
     return res.status(200).json({ success: true, data: summary });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
 };
 
-// PUT /api/expenses/budgets — update category budgets
-// Improvement 4: save budget limits per user
-const updateBudgets = async (req, res) => {
+// PUT /api/expenses/budgets
+const updateBudgets = (req, res) => {
   try {
-    const user = await User.findByIdAndUpdate(
-      req.user.id,
-      { budgets: req.body.budgets },
-      { new: true }
-    );
+    const user = users.find(u => u.id === req.user.id);
+    if (!user)
+      return res.status(404).json({ success: false, message: 'User not found' });
+
+    user.budgets = { ...user.budgets, ...req.body.budgets };
     return res.status(200).json({ success: true, budgets: user.budgets });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
 };
 
-// POST /api/expenses/insights — OpenAI spending analysis
-// Improvement 3: AI-powered insights
+// POST /api/expenses/insights
 const getInsights = async (req, res) => {
   try {
-    const expenses = await Expense.find({ userId: req.user.id }).sort({ date: -1 }).limit(50);
-    if (expenses.length === 0)
-      return res.status(200).json({ success: true, insights: 'Add some expenses first to get insights.' });
+    const userExpenses = expenses
+      .filter(e => e.userId === req.user.id)
+      .sort((a, b) => new Date(b.date) - new Date(a.date))
+      .slice(0, 50);
 
-    const summary = expenses.map(e => ({
-      amount: e.amount,
-      category: e.category,
-      description: e.description,
-      date: e.date,
-    }));
+    if (userExpenses.length === 0)
+      return res.status(200).json({ success: true, insights: 'Add some expenses first to get insights.' });
 
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [{
         role: 'user',
-        content: `Here are my recent expenses: ${JSON.stringify(summary)}.
+        content: `Here are my recent expenses: ${JSON.stringify(userExpenses.map(e => ({
+          amount: e.amount, category: e.category, description: e.description, date: e.date,
+        })))}.
 Analyze my spending habits and give me:
 1. Three specific insights about where my money is going
 2. Two actionable tips to reduce spending
 3. One category I should watch out for this month
-Keep it concise and friendly.`
+Keep it concise and friendly.`,
       }],
       max_tokens: 400,
     });
@@ -123,34 +134,35 @@ Keep it concise and friendly.`
   }
 };
 
-// POST /api/expenses/email — generate PDF and email it
+// POST /api/expenses/email
 const sendReport = async (req, res) => {
   try {
     const { recipient } = req.body;
     if (!recipient)
       return res.status(400).json({ success: false, message: 'Recipient email required' });
 
-    const expenses = await Expense.find({ userId: req.user.id }).sort({ date: -1 });
-    const total = expenses.reduce((sum, e) => sum + e.amount, 0);
+    const userExpenses = expenses
+      .filter(e => e.userId === req.user.id)
+      .sort((a, b) => new Date(b.date) - new Date(a.date));
 
-    // Generate PDF
+    const total = userExpenses.reduce((sum, e) => sum + e.amount, 0);
+
     const doc = new jsPDF();
     doc.setFontSize(20);
-    doc.text('Monthly Expense Report', 105, 20, { align: 'center' });
+    doc.text('Expense Report', 105, 20, { align: 'center' });
     doc.setFontSize(12);
     doc.text(`Generated: ${new Date().toLocaleDateString()}`, 105, 30, { align: 'center' });
-
     doc.autoTable({
       startY: 40,
-      head: [['#', 'Date', 'Category', 'Description', 'Amount (₹)']],
-      body: expenses.map((e, i) => [
+      head: [['#', 'Date', 'Category', 'Description', 'Amount']],
+      body: userExpenses.map((e, i) => [
         i + 1,
         new Date(e.date).toLocaleDateString(),
         e.category,
         e.description || '-',
-        e.amount,
+        `Rs.${e.amount}`,
       ]),
-      foot: [['', '', '', 'Total', `₹${total}`]],
+      foot: [['', '', '', 'Total', `Rs.${total}`]],
       theme: 'grid',
       styles: { fontSize: 11 },
     });
@@ -159,10 +171,7 @@ const sendReport = async (req, res) => {
 
     const transporter = nodemailer.createTransport({
       service: 'gmail',
-      auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS,
-      },
+      auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
     });
 
     await transporter.sendMail({

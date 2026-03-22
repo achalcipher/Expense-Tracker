@@ -1,10 +1,14 @@
-const jwt = require('jsonwebtoken');
-const User = require('../models/User');
+const jwt      = require('jsonwebtoken');
+const bcrypt   = require('bcryptjs');
+const { v4: uuid } = require('uuid');
+const { users } = require('../store');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_me';
 
 const generateToken = (user) =>
   jwt.sign(
-    { id: user._id, username: user.username, email: user.email },
-    process.env.JWT_SECRET,
+    { id: user.id, username: user.username, email: user.email },
+    JWT_SECRET,
     { expiresIn: '7d' }
   );
 
@@ -15,16 +19,24 @@ const register = async (req, res) => {
     if (!username || !email || !password)
       return res.status(400).json({ success: false, message: 'All fields required' });
 
-    const exists = await User.findOne({ email });
-    if (exists)
+    if (users.find(u => u.email === email))
       return res.status(409).json({ success: false, message: 'Email already registered' });
 
-    const user = await User.create({ username, email, password });
+    const hashed = await bcrypt.hash(password, 10);
+    const user = {
+      id: uuid(),
+      username,
+      email,
+      password: hashed,
+      budgets: { Grocery: 0, Vehicle: 0, Shopping: 0, Travel: 0, Food: 0, Fun: 0, Other: 0 },
+    };
+    users.push(user);
+
     const token = generateToken(user);
     return res.status(201).json({
       success: true,
       token,
-      user: { id: user._id, username: user.username, email: user.email, budgets: user.budgets }
+      user: { id: user.id, username: user.username, email: user.email, budgets: user.budgets },
     });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
@@ -38,12 +50,11 @@ const login = async (req, res) => {
     if (!email || !password)
       return res.status(400).json({ success: false, message: 'Email and password required' });
 
-    const user = await User.findOne({ email });
+    const user = users.find(u => u.email === email);
     if (!user)
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
 
-    // Improvement 1: bcrypt compare
-    const match = await user.comparePassword(password);
+    const match = await bcrypt.compare(password, user.password);
     if (!match)
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
 
@@ -51,7 +62,7 @@ const login = async (req, res) => {
     return res.status(200).json({
       success: true,
       token,
-      user: { id: user._id, username: user.username, email: user.email, budgets: user.budgets }
+      user: { id: user.id, username: user.username, email: user.email, budgets: user.budgets },
     });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
